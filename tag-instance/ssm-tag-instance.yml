@@ -1,0 +1,163 @@
+
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Applies a Tag to instances in the account using an SSM Automation Document and Association. Runs hourly. By default, will not overwrite 
+  the tag if it has already been set. Useful for setting a "Default" value for a tag if it is not set.
+Parameters:
+  Namespace:
+    Type: String
+    Default: 'Test'
+  TagKey:
+    Type: String
+  TagValue:
+    Type: String
+  ForceReplace:
+    Type: String
+    AllowedValues: ['True', 'False']
+    Default: 'False'
+Resources:
+  TagAutomation:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${Namespace}-TagInstance'
+      DocumentType: Automation
+      Content: 
+        description: |
+          # SSM Tag Instance
+          Applies a tag to an instance, optionally overwriting a tag that already exists
+        assumeRole: "{{AutomationAssumeRole}}"
+        schemaVersion: '0.3'
+        outputs:
+          - tagInstance.Result
+        parameters:
+          AutomationAssumeRole:
+            type: String          
+          Key:
+            type: String
+          Value:
+            type: String
+          ForceReplace:
+            type: String
+            default: 'False'
+            allowedValues: ['True', 'False']
+          InstanceId:
+            type: String            
+        mainSteps:
+          - name: tagInstance
+            action: 'aws:executeScript'    
+            inputs:
+              Runtime: python3.7
+              Handler: script_handler
+              InputPayload:
+                InstanceId: '{{InstanceId}}'  
+                Key: '{{Key}}'
+                Value: '{{Value}}'
+              Script: |-
+                import boto3
+
+                def script_handler (events, context):
+                    instance_id = events["InstanceId"]
+                    tag_key = events["Key"].strip()
+                    tag_value = events["Value"]
+                    force_replace = True if events.get("ForceReplace", "False").strip().lower() == "true" else False
+                    print ("InstanceId: {}".format(instance_id))
+                    print ("ForceReplace: {}".format(force_replace))
+                    print ("Key: {}".format(tag_key))
+                    print ("Value: {}".format(tag_value))
+                    ec2 = boto3.client('ec2')
+
+                    current_tags = ec2.describe_tags(
+                        Filters=[
+                            {
+                                'Name': 'resource-id',
+                                'Values': [instance_id]
+                            },
+                        ]
+                    ).get('Tags', [])
+                    current_tag_value = [tag['Value'] for tag in current_tags if tag['Key'] == tag_key]
+                    current_tag_value = current_tag_value[0] if len(current_tag_value) else None
+                    print("Current Tag Key {} Value: {}".format(tag_value, current_tag_value))
+
+                    if current_tag_value:
+                        if force_replace:
+                            print("Forcing replacement of {} with: {}".format(current_tag_value, tag_value))
+                            ec2.create_tags(
+                                Resources=[instance_id],
+                                Tags=[
+                                        {
+                                            'Key': tag_key,
+                                            'Value': tag_value
+                                        }
+                                ]
+                            ) 
+                            return "Updated: {}:{}".format(tag_key, tag_value)
+                        else: 
+                            print("Tag key already exists and will be skipped: {}: {}".format(tag_key, current_tag_value))
+                            return "Already Exists: {}: {}".format(tag_key, current_tag_value)
+                    else:
+                        print("Tag {} is not set. Setting with value {}". format(tag_key, tag_value))
+                        ec2.create_tags(
+                            Resources=[instance_id],
+                            Tags=[
+                                    {
+                                        'Key': tag_key,
+                                        'Value': tag_value
+                                    }
+                            ]
+                        )
+                        return "Set: {}: {}".format(tag_key, tag_value)   
+            outputs:
+              - Name: Result
+                Type: String
+                Selector: $.Payload
+
+  TagAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Namespace}-role-env-tag-automation-${AWS::Region}"
+      Path: '/'
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: 'sts:AssumeRole'                
+      Policies:
+        - PolicyName: "AllowReadWriteIntanceProfile"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: 
+                  - ec2:CreateTags 
+                  - ec2:DescribeTags              
+                Resource: "*"
+              
+  TagtAssociation:
+    Type: AWS::SSM::Association 
+    Properties:
+      AssociationName: !Sub ${Namespace}-TagUntaggedInstances
+      Name: !Ref TagAutomation
+      ApplyOnlyAtCronInterval: True # Don't run immediately on first association, in case the tag is being set by something else.
+      Targets:
+        - Key: InstanceIds
+          Values: 
+            - "*"
+      ScheduleExpression: 'cron(0 0/1 * * ? *)'
+      ComplianceSeverity: UNSPECIFIED
+      AutomationTargetParameterName: InstanceId
+      Parameters:
+        AutomationAssumeRole: 
+          - !GetAtt TagAutomationRole.Arn
+        Key: 
+          - !Ref TagKey
+        Value: 
+          - !Ref TagValue         
+        ForceReplace:
+          - !Ref ForceReplace
+
+
+
+      

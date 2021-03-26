@@ -1,0 +1,182 @@
+
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Attach an instance profile to an instance if one isn''t already attached, or if one is attached that should be overridden. 
+  Association triggers the automation daily.
+Parameters:
+  Namespace:
+    Type: String
+    Default: 'Test'
+    Description: Namespace for prefixing names of roles, etc.
+  InstanceProfileArn:
+    Type: String
+    Description: Arn of the instance profile
+  InstanceRoleArn:
+    Type: String
+    Description: Arn of the IAM role associated with the instance profile. 
+  OverrideInstanceProfileList:
+    Type: String
+    Description: | 
+      Comma-separated list of instance profile names to override. If any of these profiles are attached to an instance, 
+      they will be replaced with the profile specified by InstanceProfileArn
+    Default: 'AmazonSSMRoleForInstancesQuickSetup'
+Resources:
+  AttachmentAutomation:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${Namespace}-AttachBaselineInstanceProfile'
+      DocumentType: Automation
+      Content: 
+        description: |
+          # SSM Attach Baseline Profile
+          Attach an instance profile to an instance if one isn't already attached, or if one is attached that shoudl be overridden.
+        assumeRole: "{{AutomationAssumeRole}}"
+        schemaVersion: '0.3'
+        outputs:
+          - attachBaselineProfile.Result
+        parameters:
+          AutomationAssumeRole:
+            type: String          
+          AttachInstanceProfileArn:
+            type: String
+            description: The ARN of the instance profile to attach to the instance
+          InstanceId:
+            type: String
+          ForceReplace:
+            type: String
+            default: 'False'
+            description: If true, any existing instance profile attached to the instance will be replaced with the specified profile.
+            allowedValues: ['True', 'False']
+          OverrideProfileList:
+            description: Comma-separated list of instance profiles that should be overridden (replaced) if they are already attached to the instance
+            type: String
+            default: ''
+        mainSteps:
+          - name: attachBaselineProfile
+            action: 'aws:executeScript'    
+            inputs:
+              Runtime: python3.7
+              Handler: script_handler
+              InputPayload:
+                AttachInstanceProfileArn: '{{AttachInstanceProfileArn}}'
+                InstanceId: '{{InstanceId}}'  
+                ForceReplace: '{{ForceReplace}}'
+                OverrideProfileList: '{{OverrideProfileList}}'
+              Script: |-
+                import boto3
+                import time 
+                ec2 = boto3.client('ec2')
+
+                def replace_iam_instance_profile_association (attach_profile_arn, current_association_id):
+                    print("Disassociating {}".format(current_association_id))
+                    disassociated = ec2.disassociate_iam_instance_profile(
+                        AssociationId=current_association_id
+                    ).get('IamInstanceProfileAssociation', {})  
+                    instance_id = disassociated.get('InstanceId', '')
+                    state = disassociated.get('State', 'disassociated')
+                    if state != 'disassociated': 
+                        time.sleep(30)
+                    print("Attaching {} to {}".format(attach_profile_arn, instance_id))
+                    return ec2.associate_iam_instance_profile(
+                        IamInstanceProfile={'Arn': attach_profile_arn},
+                        InstanceId=instance_id                     
+                    )    
+
+                def script_handler (events, context):
+                    instance_id = events["InstanceId"]
+                    attach_profile_arn = events["AttachInstanceProfileArn"]
+                    force_replace = True if events.get("ForceReplace", "False").strip().lower() == "true" else False
+                    override_profiles_list = events.get("OverrideProfileList", "").split(",")
+                    print ("InstanceId: {}".format(instance_id))
+                    print ("AttachInstanceProfileArn: {}".format(attach_profile_arn))
+                    print ("ForceReplace: {}".format(force_replace))
+                    print ("OverrideProfileList: {}".format(",".join(override_profiles_list)))
+
+                    current_association = ec2.describe_iam_instance_profile_associations(
+                        Filters=[
+                            {
+                                'Name': 'instance-id',
+                                'Values': [instance_id]
+                            },
+                        ]
+                    ).get('IamInstanceProfileAssociations', [])
+                    current_association = current_association[0] if len(current_association) else {}
+                    current_association_id = current_association.get('AssociationId', '')
+                    current_association_profile_arn = current_association.get('IamInstanceProfile', {}).get('Arn', '')
+                    
+                    if not current_association:
+                        print("No instance profile attached, assigning.")
+                        ec2.associate_iam_instance_profile(
+                            IamInstanceProfile={'Arn': attach_profile_arn},
+                            InstanceId=instance_id                     
+                        )
+                        return "Attached: {}".format(attach_profile_arn)
+                    elif force_replace:
+                        print("Forcing replacement: Association {} profile {}".format(current_association_id, current_association_profile_arn))
+                        replace_iam_instance_profile_association(attach_profile_arn, current_association_id)  
+                        return "Forcefully Replaced: {}". format(attach_profile_arn)
+                    else:    
+                        current_profile_name = current_association_profile_arn.rsplit('/',2)[1].strip()
+                        for profile in override_profiles_list:
+                            if current_profile_name.strip().lower() == profile.strip().lower():
+                                print("Overriding: Association {} profile {} with {}".format(current_association_id, current_profile_name, attach_profile_arn))
+                                replace_iam_instance_profile_association(attach_profile_arn, current_association_id)
+                                return "Overridden: Association {} profile {} with {}".format(current_association_id, current_profile_name, attach_profile_arn)
+                        print("Skipped: Existing profile {} already attached".format(current_profile_name))
+                        return "Skipped: Existing profile {} already attached".format(current_profile_name)
+            outputs:
+              - Name: Result
+                Type: String
+                Selector: $.Payload
+
+  AttachmentAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      RoleName: !Sub "${Namespace}-role-attachment-automation-${AWS::Region}"
+      AssumeRolePolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: 'sts:AssumeRole'                
+      Policies:
+        - PolicyName: "AllowReadWriteIntanceProfile"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: 
+                  - ec2:ReplaceIamInstanceProfileAssociation 
+                  - ec2:AssociateIamInstanceProfile    
+                  - ec2:DisassociateIamInstanceProfile
+                  - ec2:DescribeIamInstanceProfileAssociations        
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - iam:PassRole
+                Resource: !Sub "${InstanceRoleArn}"
+
+              
+  AttachmentAssociation:
+    Type: AWS::SSM::Association 
+    Properties:
+      AssociationName: !Sub ${Namespace}-AttachBaselineInstanceProfile
+      Name: !Ref AttachmentAutomation
+      Targets:
+        - Key: InstanceIds
+          Values: 
+            - "*"
+      ScheduleExpression: 'rate(1 day)'
+      ComplianceSeverity: UNSPECIFIED
+      AutomationTargetParameterName: InstanceId
+      Parameters:
+        AutomationAssumeRole: 
+          - !GetAtt AttachmentAutomationRole.Arn
+        OverrideProfileList: 
+          - !Split [',', !Ref OverrideInstanceProfileList]
+        AttachInstanceProfileArn: 
+          - !Sub ${InstanceProfileArn}
+
